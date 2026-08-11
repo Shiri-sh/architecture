@@ -8,7 +8,7 @@ core/integration-service.md 225L — Test orchestration, snapshot creation/valid
 core/konflux-operator.md 41L — Platform installation and lifecycle management via Konflux CR
 core/konflux-ui.md 20L — Web UI for Konflux platform (minimal architecture docs in this repo)
 core/pipeline-service.md 134L — Foundational Tekton APIs, Pipelines as Code, Chains (signing), Results (archival)
-core/release-service.md 147L — Release orchestration, privileged pipelines, cross-namespace releases
+core/release-service.md 136L — Release orchestration, privileged pipelines, cross-namespace releases
 add-ons/image-controller.md 216L — Image repository setup, robot account management, secret linking to ServiceAccounts
 add-ons/index.md 239L — Add-ons
 add-ons/internal-services.md 141L — Remote cluster polling for executing internal jobs across network boundaries

@@ -31,7 +31,7 @@ Beyond README badges, the same service can power **monitoring dashboards**, **po
 ### Constraints
 
 - README is rendered by GitHub — badge URL must be **reachable over public HTTPS**.
-- Konflux primary API is **Kubernetes CRDs** ([architecture overview](https://konflux-ci.dev/architecture/)); user-facing HTTP endpoints are exceptional but have established precedent (Tekton Results ingress per [Pipeline Service](../architecture/core/pipeline-service.md) and [ADR-0009](0009-pipeline-service-via-operator.md), PaC webhook receiver per [ADR-0039](0039-workspace-deprecation.md), registration-service). The [architecture overview](../architecture/index.md) permits these exceptions when justified.
+- Konflux primary API is **Kubernetes CRDs** ([architecture overview](https://konflux-ci.dev/architecture/)); user-facing HTTP endpoints are exceptional. The [architecture overview](../architecture/index.md) distinguishes two precedents: endpoints that expose **user/tenant cluster data** (e.g. Tekton Results ingress per [Pipeline Service](../architecture/core/pipeline-service.md) and [ADR-0009](0009-pipeline-service-via-operator.md)) require **SubjectAccessReviews** for consistent RBAC; **unauthenticated supporting endpoints** that do not expose tenant data (PaC webhook receiver per [ADR-0039](0039-workspace-deprecation.md), sprayproxy, registration-service) follow a separate precedent. **Phases 1–2** read public GitHub Checks data only — same category as the latter.
 - Check runs are the status entries visible on each commit's **Checks tab** — the `-on-push` pipelines and `enterprise-contract` checks that PaC reports back to GitHub.
 - Check names are **per-component** (`*-on-push`, `*enterprise-contract*`), not one org-wide GitHub check name.
 - **Ring / release** status is not fully on GitHub Checks — requires cluster data (Tekton Results, Release CRs) later.
@@ -72,7 +72,7 @@ sequenceDiagram
     GH-->>Viewer: Render badge
 ```
 
-**Public vs private (one URL, different response):** the service reads `repo.private` from the GitHub API. **Public** → fetch check runs, return real status SVG/JSON. **Private** → unauthenticated SVG returns a neutral badge only (no pass/fail); real status stays on GitHub Checks (for users with repo access). Returning real status for private repos on an open URL would let anyone who knows `org/repo/branch` learn build health without repo access.
+**Public vs private (one URL, different response):** the service reads `repo.private` from the GitHub API (cached ~15 min). **Public** → fetch check runs, return real status SVG/JSON. **Private** → requests without a valid signature get a neutral badge only (Phase 1). Phase 2 adds an HMAC query parameter for private README embeds (see below). **Fail-closed:** if repo visibility cannot be determined (API failure, rate limiting, cache miss with no response), return a **neutral badge** — never assume public.
 
 ### API shape
 
@@ -83,7 +83,7 @@ GET /badge/{githubOrg}/{githubRepo}/{branch}/build.json → application/json
 GET /badge/{githubOrg}/{githubRepo}/{branch}/ec.json    → application/json
 ```
 
-The **SVG endpoints** return badge images for README embedding. The **JSON endpoints** return structured status data for programmatic consumers:
+JSON response example (public repo, or private repo with valid `sig` in Phase 2):
 
 ```json
 {
@@ -97,7 +97,7 @@ The **SVG endpoints** return badge images for README embedding. The **JSON endpo
 }
 ```
 
-- **Data path**: resolve branch HEAD SHA → paginate `GET /repos/{org}/{repo}/commits/{sha}/check-runs` → aggregate `*-on-push` / `enterprise-contract` → pass | fail | running.
+- **Data path**: resolve branch HEAD SHA → paginate `GET /repos/{org}/{repo}/commits/{sha}/check-runs` → aggregate `*-on-push` / `enterprise-contract` → pass | fail | running | **unknown** (no matching check runs, e.g. newly onboarded or unconfigured branch).
 - **Rendering**: `badge-maker` library ([MIT OR Apache-2.0](https://github.com/badges/shields/tree/master/badge-maker)) or equivalent minimal SVG — **not** shields.io SaaS `check-runs` route.
 - **No tenant resolution needed initially**: The data source is the GitHub API, not cluster-internal data. The service only needs the GitHub org, repo, and branch to query check runs.
 
@@ -109,28 +109,34 @@ The **SVG endpoints** return badge images for README embedding. The **JSON endpo
 
 ### Security and auth model
 
-**Data exposure**: The endpoints expose **only aggregated pass / fail / running status**. No build logs, error messages, pipeline details, or secrets are returned. For public repositories, this status is already visible on GitHub's Checks tab without authentication, so the badge service does not increase the exposure surface. The badge endpoint is intentionally **unauthenticated** because GitHub's markdown renderer fetches badge images as an anonymous HTTP client. The architecture guidance to use `SubjectAccessReview` for exceptional HTTP endpoints does not apply here; that mechanism is for authenticated cluster API access. Phase 3 cluster data queries will use SAR-guarded access when reading Tekton Results or Release CRs.
+**GitHub credential**: reuses the **PaC GitHub App** on the hosting cluster ([Pipeline Service](../architecture/core/pipeline-service.md), [ADR-0039](0039-workspace-deprecation.md), [ADR-0009](0009-pipeline-service-via-operator.md)). No new App installation required.
 
-**GitHub credential**: The service authenticates to the GitHub API using the **existing PaC GitHub App** on its hosting cluster ([Pipeline Service docs](../architecture/core/pipeline-service.md), [ADR-0039](0039-workspace-deprecation.md), [ADR-0009](0009-pipeline-service-via-operator.md)). Each Konflux cluster registers a separate GitHub App ([ADR-0039](0039-workspace-deprecation.md)); the badge service reads that cluster's App credentials (stored as a Kubernetes Secret). That App already has `checks:read` permission. No new GitHub App installation is required.
+**Exposure**: SVG endpoint is unauthenticated (required for README/camo). Returns pass/fail/running for **public** repos only; **private** repos get a neutral SVG. No logs, secrets, or pipeline details. Phase 3 cluster reads will use SAR-guarded access.
 
-**Public endpoint protection**:
+**Protection**: per-IP rate limiting at ingress; public badge URLs contain only org/repo/branch.
 
-- **Rate limiting**: per-IP rate limiting (e.g. 60 requests/minute per IP) at the ingress level.
-- **No secrets in URLs**: badge URLs contain only the GitHub org, repo, and branch — information that is already public for public repositories.
+### Phase 2 — Private repository access (planned)
 
-**Private repositories**: GitHub's image renderer cannot fetch badges for private repos (it makes an anonymous GET). Initially, private repo badges return a neutral "private" shield or a 404. Users of private repos can use the `.json` endpoint from authenticated contexts instead. A future signed-URL-with-TTL scheme could address this but requires further design.
+Private README badges cannot use `Authorization` headers (camo sends a plain GET). Phase 2 adds an **HMAC signature** on the existing URL:
+
+```
+GET /badge/{org}/{repo}/{branch}/build?sig=<hmac>
+```
+
+The service verifies `sig` against a cluster signing secret (`HMAC(secret, org/repo/branch/type)`). Valid signature on a private repo → return real status; missing or invalid → neutral badge (same as Phase 1). Signatures are **not short-lived** (README markdown is static). Konflux UI or CLI generates the signed URL when the user copies embed markdown. Rotating the signing secret invalidates all existing signed badge URLs; users must re-copy embed markdown.
 
 ### Caching and GitHub API rate limits
 
-The [5,000 requests/hour](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) limit is **per GitHub App installation**, **shared with PaC** (check runs, webhooks, PR comments, etc.). Badge service must monitor `X-RateLimit-Remaining` and back off.
+The [5,000 requests/hour](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) limit is **per GitHub App installation**, **shared with PaC** (check runs, webhooks, PR comments, etc.) **and MintMaker** (dependency update scans via the same App token — see [MintMaker](../architecture/add-ons/mintmaker.md)). MintMaker is already rate-limited on some installations. Badge service must be the **lowest-priority consumer**: monitor `X-RateLimit-Remaining` and back off before PaC or MintMaker are affected.
 
-- Cache badge results per `{org}/{repo}/{branch}/{type}` (TTL 30–60s).
+- Cache badge results per `{org}/{repo}/{branch}/{type}` (TTL 30–60s; increase to several minutes if remaining quota is low).
 - Cache `repo.private` (~15 min).
-- At 60s TTL, ~120 GitHub calls/hour per badge key. If ~3,000/hour is used by PaC, ~16 badge keys (~8 repos × 2 types) fit in the remainder under sustained load. Size TTL and repo count to **remaining** quota.
+- When GitHub rate limit is exhausted or the service backs off to protect PaC/MintMaker quota, return a **neutral badge** (no status) — do not serve stale or guessed status.
+- At 60s TTL, ~120 GitHub calls/hour per badge key. At 5-min TTL, ~12 calls/hour — significantly reducing pressure. Size TTL and repo count to **remaining** quota.
 
 ### Deployment model
 
-**Initial deployment: single instance on one cluster.** Since the data source is the GitHub Checks API, the badge service does not need access to tenant namespaces for Phase 1. It deploys as a Deployment on a single Konflux cluster, reading that cluster's PaC GitHub App credentials. A Kubernetes Ingress or Route exposes it at a public URL. It serves badges only for repos where **its hosting cluster's** PaC GitHub App is installed and has `checks:read` access. Repos whose tenants are onboarded on other clusters use a different GitHub App per [ADR-0039](0039-workspace-deprecation.md); those repos require a badge service instance (or equivalent routing) on the cluster that owns that App installation.
+**Phase 1 requirements: a GitHub App token and a public HTTPS endpoint.** The badge service does not need access to tenant namespaces or cluster-internal APIs for Phase 1. It can run on **any Kubernetes cluster** (or equivalent runtime) that has the GitHub App credentials and a publicly reachable ingress. The service serves badges only for repos where the configured GitHub App is installed and has `checks:read` access. In multi-cluster Konflux installations, each cluster has its own GitHub App per [ADR-0039](0039-workspace-deprecation.md); repos onboarded on different clusters require a badge service instance (or routing) per App installation.
 
 **Evolution for cluster data sources.** When the service extends to read Tekton Results or Release CRs, it will need access to cluster-internal APIs. The deployment model evolves within the same codebase — new data source implementations are added. Two routing options exist:
 
@@ -145,12 +151,12 @@ This decision is deferred because it depends on which cluster data sources are n
 1. Deploy the badge service on one Konflux cluster.
 2. The service accepts any `{org}/{repo}` for which **its hosting cluster's** PaC GitHub App has installation access. No per-repo onboarding configuration is needed.
 3. Support `build` and `ec` badge types (SVG and JSON).
-4. Private repos get a neutral "private" badge.
+4. Private repos: neutral SVG and JSON (no status until Phase 2 `sig`).
 5. Validate caching, rate limits, and SVG rendering in production.
 
-**Phase 2 — Broader adoption**:
-1. Promote the JSON endpoint for dashboard and monitoring use cases.
-2. Consider webhook-based cache invalidation for near-real-time badge updates.
+**Phase 2 — Private repo badges**:
+1. Verify HMAC `sig` query param on existing badge URLs for private repos.
+2. Konflux UI or CLI generates signed embed markdown for private repos.
 
 **Phase 3 — Cluster data sources**:
 1. Extend to read Tekton Results for richer status (pipeline duration, last N runs).
@@ -168,6 +174,10 @@ This decision is deferred because it depends on which cluster data sources are n
 | Deploy per-cluster from the start | Design review | **Deferred** | Unnecessary for GitHub-only data path. Adds deployment complexity without benefit until the service reads cluster-internal data. |
 | Extend Tekton Results with a badge endpoint | Design review | **Rejected** | Tekton Results is an upstream project (`tektoncd/results`) — adding Konflux-specific badge logic there is out of scope. Bearer token auth incompatible with GitHub's anonymous image fetching. Badge service reads GitHub Checks (reported by PaC), not raw PipelineRun results. |
 | JSON-only service + self-hosted Shields for SVG | Design review | **Rejected** | Requires deploying two services. `badge-maker` renders SVG trivially; single service serving both JSON and SVG is simpler to operate. |
+| Opaque token registry (`/badge/t/{token}`) | Design review | **Rejected** | Requires per-badge storage and CRD; HMAC on existing URL is simpler. |
+
+
+
 
 ## Consequences
 
@@ -179,16 +189,17 @@ This decision is deferred because it depends on which cluster data sources are n
 - **Extensible** to Ring/release via cluster APIs without changing README embed pattern.
 - Spike CLI logic maps directly to service handlers.
 - **Broader utility**: the JSON endpoint enables dashboards, Slack integrations, and portfolio views.
-- **Simple initial deployment**: single instance on one cluster, reusing PaC's existing GitHub App credentials.
+- **Simple initial deployment**: single instance on any cluster with a GitHub App token and public ingress.
 - **Follows established precedent**: public HTTP endpoints exist in Konflux (Tekton Results, PaC webhook receiver, registration-service).
+- **Private-repo safety**: neutral badge avoids status leakage on unauthenticated SVG endpoint.
 
 ### Negative / compromises
 
 - **New operational component**: deploy, monitor, rate-limit, and secure a public HTTP endpoint.
-- **Private repo limitation**: badges unavailable for private repos until a signed-URL scheme is designed.
+- **Private repo README badges show no status** in Phase 1 (neutral badge only). Most onboarded repos may be private; primary value for them is JSON behind auth and Checks tab (unchanged).
 - **Cache staleness**: badge status may lag real-time by up to 60 seconds.
-- **Shared GitHub API rate limit**: badge service competes with PaC for the same 5,000/hour per installation; must monitor remaining quota and size cache TTL accordingly.
-- **GitHub API dependency**: if GitHub is down or rate-limited, badges degrade to a "status unknown" state.
+- **Shared GitHub API rate limit**: badge service competes with PaC and MintMaker for the same 5,000/hour per installation; must be the lowest-priority consumer and back off first.
+- **GitHub API dependency**: if GitHub is down, rate-limited, or repo visibility cannot be determined, badges degrade to a **neutral badge** (no status).
 - **Deployment model must evolve**: adding cluster-internal data sources requires per-cluster deployment or a routing layer, which will need its own design work.
 - **Exceptional HTTP endpoint**: adds another exception to the "kube API server is the API server" constraint, justified by the use case and mitigated by the read-only, minimal-data nature of the endpoint.
 

@@ -28,26 +28,15 @@ Today, users must open the Konflux UI (SSO) or the GitHub Checks popup to see st
 
 Beyond README badges, the same service can power **monitoring dashboards**, **portfolio status pages**, and **third-party integrations** (Slack bots, Jira, Confluence) via a JSON endpoint.
 
-### Spike findings
-
-We evaluated options and measured real repositories (`konflux-ci/konflux-ci`, `konflux-ci/segment-bridge`).
-
-| Approach | Tested | Verdict | Why |
-|---|---|---|---|
-| Shields.io `github/check-runs` | Live URLs + [source](https://github.com/badges/shields/blob/master/services/github/github-check-runs.service.js) | **Rejected** | Reads only first ~30 check-run rows. Busy repos have 50–70+; Konflux `*-on-push` often at row 31+ → `no check runs`. Third-party SaaS; weak for private repos. |
-| GitHub Action → commit `badge/*.svg` | Prototype workflow | **Rejected** | Mixes CI status into source; per-repo maintenance; org-wide pattern needs ADR anyway. |
-| Tekton task → git push SVG | Design review | **Rejected** | Same concerns as git-commit approach. |
-| Self-hosted Shields (`check-runs`) | Code review | **Rejected** | Same 30-row limit unless forked. Self-host helps RH control, not pagination. |
-| **Spike CLI: paginated Checks → SVG** | `go run` against segment-bridge | **Works** | Proves data + render logic; basis for service design. |
-
 ### Constraints
 
-- README is rendered by GitHub — badge URL must be **reachable without user SSO** (public HTTPS or designed private-repo auth).
+- README is rendered by GitHub — badge URL must be **reachable over public HTTPS**.
 - Konflux primary API is **Kubernetes CRDs** ([architecture overview](https://konflux-ci.dev/architecture/)); user-facing HTTP endpoints are exceptional but have established precedent (Tekton Results ingress per [Pipeline Service](../architecture/core/pipeline-service.md) and [ADR-0009](0009-pipeline-service-via-operator.md), PaC webhook receiver per [ADR-0039](0039-workspace-deprecation.md), registration-service). The [architecture overview](../architecture/index.md) permits these exceptions when justified.
 - Check runs are the status entries visible on each commit's **Checks tab** — the `-on-push` pipelines and `enterprise-contract` checks that PaC reports back to GitHub.
 - Check names are **per-component** (`*-on-push`, `*enterprise-contract*`), not one org-wide GitHub check name.
 - **Ring / release** status is not fully on GitHub Checks — requires cluster data (Tekton Results, Release CRs) later.
 - Konflux runs on **multiple production clusters**, and tenants from the same GitHub organization may be spread across different clusters.
+- Konflux onboarding data (Component CRs, tenant config) records **git URLs** but not GitHub repository visibility (public vs private). The proportion of private onboarded repos is unknown without querying the GitHub API per repository.
 
 ## Decision
 
@@ -58,6 +47,32 @@ Introduce a **Konflux Badge Service** — a new **read-only HTTP service** (host
 3. Uses the **paginated GitHub Checks API** initially for **build** and **EC** status on a branch HEAD.
 4. Extends later to **Tekton Results / Konflux CRs** for Ring and richer status, within the same codebase.
 5. Uses a **server-side GitHub credential** (GitHub App installation token stored in a Kubernetes Secret).
+
+### Data flow
+
+GitHub README images are fetched by GitHub's [camo proxy](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-anonymized-urls) — a plain HTTPS GET with **no viewer login** passed to the badge service. The badge service calls the GitHub API using the **PaC GitHub App** installation token (same App/credentials PaC uses to report check runs; stored in a cluster Secret).
+
+```mermaid
+sequenceDiagram
+    participant Viewer
+    participant GH as GitHub (README + camo)
+    participant Badge as Badge Service
+    participant GHAPI as GitHub API
+
+    Viewer->>GH: Open README
+    GH->>Badge: GET /badge/{org}/{repo}/{branch}/build
+    Badge->>GHAPI: GET /repos/{org}/{repo} (App token)
+    GHAPI-->>Badge: private: true/false
+    alt public repo
+        Badge->>GHAPI: GET check-runs
+        Badge-->>GH: SVG (pass/fail/running)
+    else private repo
+        Badge-->>GH: SVG (neutral — no status)
+    end
+    GH-->>Viewer: Render badge
+```
+
+**Public vs private (one URL, different response):** the service reads `repo.private` from the GitHub API. **Public** → fetch check runs, return real status SVG/JSON. **Private** → unauthenticated SVG returns a neutral badge only (no pass/fail); real status stays on GitHub Checks (for users with repo access). Returning real status for private repos on an open URL would let anyone who knows `org/repo/branch` learn build health without repo access.
 
 ### API shape
 
@@ -149,15 +164,14 @@ This decision is deferred because it depends on which cluster data sources are n
 
 ## Alternatives Considered
 
-| Alternative | Verdict | Rationale |
-|---|---|---|
-| Shields.io SaaS only | **Rejected** | Low effort but fails at scale (pagination, third party, private repos). |
-| Per-repo GitHub Action publisher | **Rejected** | Technically viable; CI status in git plus N workflows to maintain is not org-scalable. |
-| Konflux UI deep-link only | **Insufficient** | Meets "see status" but not embeddable badge — does not satisfy stated product goal. |
-| Self-hosted Shields (`check-runs`) | **Rejected** | Does not fix pagination without a fork. Acceptable only as renderer (`endpoint?url=<our JSON>`); direct SVG is simpler. |
-| Deploy per-cluster from the start | **Deferred** | Unnecessary for GitHub-only data path. Adds deployment complexity without benefit until the service reads cluster-internal data. |
-| Extend Tekton Results with a badge endpoint | **Rejected** | Tekton Results is an upstream project (`tektoncd/results`) — adding Konflux-specific badge logic there is out of scope. It also uses Bearer token auth, incompatible with GitHub's anonymous image fetching. |
-| JSON-only service + self-hosted Shields for SVG | **Rejected** | Requires deploying two services. Since `badge-maker` handles SVG rendering trivially, a single service serving both JSON and SVG is simpler to operate. |
+| Alternative | Evaluated | Verdict | Rationale |
+|---|---|---|---|
+| Shields.io SaaS `github/check-runs` | Live URLs on `konflux-ci/konflux-ci`, `konflux-ci/segment-bridge`; [source review](https://github.com/badges/shields/blob/master/services/github/github-check-runs.service.js) | **Rejected** | Reads only first ~30 check-run rows. Busy repos have 50–70+; Konflux `*-on-push` often at row 31+ → `no check runs`. Third-party SaaS; weak for private repos. |
+| GitHub Action → commit `badge/*.svg` to repo | Prototype workflow | **Rejected** | Mixes CI status into source; per-repo maintenance; |
+| Tekton task → git push SVG | Design review | **Rejected** | Same concerns as git-commit approach. |
+| Deploy per-cluster from the start | Design review | **Deferred** | Unnecessary for GitHub-only data path. Adds deployment complexity without benefit until the service reads cluster-internal data. |
+| Extend Tekton Results with a badge endpoint | Design review | **Rejected** | Tekton Results is an upstream project (`tektoncd/results`) — adding Konflux-specific badge logic there is out of scope. Bearer token auth incompatible with GitHub's anonymous image fetching. Badge service reads GitHub Checks (reported by PaC), not raw PipelineRun results. |
+| JSON-only service + self-hosted Shields for SVG | Design review | **Rejected** | Requires deploying two services. `badge-maker` renders SVG trivially; single service serving both JSON and SVG is simpler to operate. |
 
 ## Consequences
 

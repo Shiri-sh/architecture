@@ -122,15 +122,11 @@ The **SVG endpoints** return badge images for README embedding. The **JSON endpo
 
 ### Caching and GitHub API rate limits
 
-GitHub App installation tokens have a rate limit of [5,000 requests/hour](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) per installation. Without caching, a popular repo's badge could exhaust this budget quickly.
+The [5,000 requests/hour](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) limit is **per GitHub App installation**, **shared with PaC** (check runs, webhooks, PR comments, etc.). Badge service must monitor `X-RateLimit-Remaining` and back off.
 
-**Caching strategy**:
-
-- The service caches the computed badge result per `{org}/{repo}/{branch}/{type}` with a **TTL of 30–60 seconds**. Badge status may lag real-time by up to one minute, which is acceptable for README display.
-- Cache invalidation is TTL-based initially. A future enhancement could use GitHub webhooks (`check_suite` events) for near-real-time invalidation.
-- SVG responses include `Cache-Control: no-cache, no-store` headers to prevent GitHub's [camo proxy](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-anonymized-urls) from serving stale images.
-
-**Rate budget**: With a 60-second cache TTL, each unique `{org}/{repo}/{branch}/{type}` key generates at most 120 GitHub API calls per hour (60 cache refreshes × 2 calls per refresh: resolve HEAD SHA + paginated check-runs). A single GitHub App installation (5,000 requests/hour) therefore supports roughly **40 badge keys** (~20 repos × 2 badge types) under sustained worst-case load. At a 30-second TTL, the budget halves to ~20 keys (~10 repos). README traffic is typically bursty and lower than this worst case, but cache TTL and the number of onboarded repos must be sized to stay within the per-installation limit.
+- Cache badge results per `{org}/{repo}/{branch}/{type}` (TTL 30–60s).
+- Cache `repo.private` (~15 min).
+- At 60s TTL, ~120 GitHub calls/hour per badge key. If ~3,000/hour is used by PaC, ~16 badge keys (~8 repos × 2 types) fit in the remainder under sustained load. Size TTL and repo count to **remaining** quota.
 
 ### Deployment model
 
@@ -191,7 +187,7 @@ This decision is deferred because it depends on which cluster data sources are n
 - **New operational component**: deploy, monitor, rate-limit, and secure a public HTTP endpoint.
 - **Private repo limitation**: badges unavailable for private repos until a signed-URL scheme is designed.
 - **Cache staleness**: badge status may lag real-time by up to 60 seconds.
-- **GitHub API rate limit**: each GitHub App installation supports a finite number of repos at a given cache TTL (see Caching section). Multi-cluster deployments need one badge service per cluster (or per GitHub App installation).
+- **Shared GitHub API rate limit**: badge service competes with PaC for the same 5,000/hour per installation; must monitor remaining quota and size cache TTL accordingly.
 - **GitHub API dependency**: if GitHub is down or rate-limited, badges degrade to a "status unknown" state.
 - **Deployment model must evolve**: adding cluster-internal data sources requires per-cluster deployment or a routing layer, which will need its own design work.
 - **Exceptional HTTP endpoint**: adds another exception to the "kube API server is the API server" constraint, justified by the use case and mitigated by the read-only, minimal-data nature of the endpoint.
@@ -202,6 +198,6 @@ This decision is deferred because it depends on which cluster data sources are n
 - [Pipeline Service — Tekton Results ingress and GitHub App](../architecture/core/pipeline-service.md)
 - [ADR-0009 Pipeline Service via Operator](0009-pipeline-service-via-operator.md) — Tekton/PaC deployment model
 - [ADR-0039 Workspace Deprecation — per-cluster GitHub App model](0039-workspace-deprecation.md)
-- [GitHub Apps rate limits](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) — 5,000 requests/hour per installation
+- [GitHub Apps rate limits](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/rate-limits-for-github-apps) — 5,000 requests/hour per installation (shared)
 - [badge-maker library](https://github.com/badges/shields/tree/master/badge-maker) — MIT/Apache-2.0 SVG generation
 - [GitHub camo proxy](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-anonymized-urls) — how GitHub proxies images in README files
